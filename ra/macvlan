@@ -1,0 +1,358 @@
+#!/bin/bash
+#
+#	MAC VLAN Interface RA.
+#	It creates MAC VLAN interface dynamically.
+#
+# Copyright (c) 2014 Takehiro Matsushima  All Rights Reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# Defaults
+OCF_RESKEY_macvlan_mode_default="private"
+
+: ${OCF_RESKEY_macvlan_mode=${OCF_RESKEY_macvlan_mode_default}}
+
+
+#######################################################################
+
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="macvlan" version="0.9">
+<version>0.9</version>
+
+<longdesc lang="en">
+This RA manages macvlan interfaces.
+It can create and delete.
+</longdesc>
+<shortdesc lang="en">Manages macvlan interfaces</shortdesc>
+
+<parameters>
+<parameter name="macvlan_ifname" unique="1" required="1">
+<longdesc lang="en">
+MAC VLAN interface name.
+</longdesc>
+<shortdesc lang="en">macvlan ifname</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="macvlan_linkto" unique="0" required="1">
+<longdesc lang="en">
+Interface name that MAC VLAN interface links to.
+</longdesc>
+<shortdesc lang="en">macvlan links ifname</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="macvlan_macaddr" unique="1" required="1">
+<longdesc lang="en">
+MAC address for MAC VLAN interface.
+</longdesc>
+<shortdesc lang="en">macaddr for macvlan</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="macvlan_mode" unique="0" required="0">
+<longdesc lang="en">
+MAC VLAN interface mode in [private | vepa | bridge | passthru].
+"private" is default.
+</longdesc>
+<shortdesc lang="en">macvlan mode</shortdesc>
+<content type="string" default="private" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="20" />
+<action name="stop"         timeout="20" />
+<action name="monitor"      timeout="20" interval="10" depth="0" />
+<action name="reload"       timeout="20" />
+<action name="migrate_to"   timeout="20" />
+<action name="migrate_from" timeout="20" />
+<action name="meta-data"    timeout="5" />
+<action name="validate-all"   timeout="20" />
+</actions>
+</resource-agent>
+END
+}
+
+#######################################################################
+
+macvlan_usage() {
+	cat <<END
+usage: $0 {start|stop|monitor|migrate_to|migrate_from|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+macvlan_start() {
+	local ret
+	local ifname
+	local linkto
+	local address
+	local mode
+	local error
+
+	macvlan_validate_all || exit $?
+	macvlan_monitor
+	ret=$?
+
+	if [ "$ret" -ne "${OCF_NOT_RUNNING}" ]; then
+		return $ret
+	fi
+
+	ifname=${OCF_RESKEY_macvlan_ifname}
+	linkto=${OCF_RESKEY_macvlan_linkto}
+	address=${OCF_RESKEY_macvlan_macaddr}
+	mode=${OCF_RESKEY_macvlan_mode}
+
+	error="$(${IP2UTIL} link set dev ${linkto} up)"
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "Unable to be up ${linkto}: ${error}"
+		return $OCF_ERR_GENERIC
+	fi
+
+	error="$(${IP2UTIL} link add link ${linkto} name ${ifname} address ${address} type macvlan mode ${mode})"
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "Unable to create MACVLAN interface ${ifname}(${address}) which links to ${linkto}: ${error}"
+		return $OCF_ERR_GENERIC
+	fi
+
+	error="$(${IP2UTIL} link set dev ${ifname} up)"
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "Unable to be up MACVLAN interface ${ifname}(${address}) which links to ${linkto}: ${error}"
+		return $OCF_ERR_GENERIC
+	fi
+
+	error="$(touch "$HA_RSCTMP/macvlan.$OCF_RESKEY_macvlan_ifname" 2>&1)"
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "Unable to create lock file for MACVLAN ${OCF_RESKEY_vlan_name}: ${error}"
+		return $OCF_ERR_GENERIC
+	fi
+
+	return $OCF_SUCCESS
+}
+
+macvlan_stop() {
+	local ret
+
+	macvlan_monitor
+	ret=$?
+	if [ "$ret" -eq "${OCF_NOT_RUNNING}" ]; then
+		return $OCF_SUCCESS
+	fi
+	if [ "$ret" -ne "${OCF_ERR_GENERIC}" ]; then
+		return $ret
+	fi
+
+	${IP2UTIL} link set dev ${OCF_RESKEY_macvlan_ifname} down >/dev/null 2>&1
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "MACVLAN interface ${OCF_RESKEY_macvlan_ifname} is unable to be down"
+		return $OCF_ERR_GENERIC
+	fi
+
+	${IP2UTIL} link delete ${OCF_RESKEY_macvlan_ifname} >/dev/null 2>&1
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "Unable to delete MACVLAN interface ${OCF_RESKEY_macvlan_ifname}"
+		return $OCF_ERR_GENERIC
+	fi
+
+	rm -f "${HA_RSCTMP}/macvlan.${OCF_RESKEY_macvlan_ifname}"
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "Unable to remove lock file for MACVLAN ${OCF_RESKEY_macvlan_ifname}"
+		return $OCF_ERR_GENERIC
+	fi
+
+	return $OCF_SUCCESS
+}
+
+macvlan_force_stop() {
+	${IP2UTIL} link delete ${OCF_RESKEY_macvlan_ifname}
+	rm -f "${HA_RSCTMP}/macvlan.${OCF_RESKEY_macvlan_ifname}"
+}
+
+macvlan_monitor() {
+	${IP2UTIL} -o link show ${OCF_RESKEY_macvlan_ifname}
+	if [ "$?" -eq 0 ]; then
+		if [ ! -e "${HA_RSCTMP}/macvlan.${OCF_RESKEY_macvlan_ifname}" ]; then
+			return $OCF_ERR_GENERIC
+		fi
+	else
+		if [ -e "${HA_RSCTMP}/macvlan.${OCF_RESKEY_macvlan_ifname}" ]; then
+			rm -f "${HA_RSCTMP}/macvlan.${OCF_RESKEY_macvlan_ifname}" >/dev/null 2>&1
+			if [ "$?" -ne 0 ]; then
+				ocf_log err "Unable to remove lock file for MACVLAN ${OCF_RESKEY_macvlan_ifname}"
+				return $OCF_ERR_GENERIC
+			fi
+		fi
+		return $OCF_NOT_RUNNING
+	fi
+
+	if ! interface_is_up ${OCF_RESKEY_macvlan_linkto}; then
+		ocf_log err "MACVLAN interface ${OCF_RESKEY_macvlan_ifname} is administratively down"
+		return $OCF_ERR_GENERIC
+	fi
+
+	if ! interface_is_up ${OCF_RESKEY_macvlan_ifname}; then
+		ocf_log err "MACVLAN interface ${OCF_RESKEY_macvlan_ifname} is administratively down"
+		return $OCF_ERR_GENERIC
+	fi
+
+	if ! interface_lower_is_up ${OCF_RESKEY_macvlan_ifname}; then
+		ocf_log err "MACVLAN interface ${OCF_RESKEY_macvlan_ifname} has no active link-layer"
+		return $OCF_ERR_GENERIC
+	fi
+
+	return $OCF_SUCCESS
+}
+
+interface_is_up() {
+	local ifstatus=$(${IP2UTIL} -o link show $1)
+	echo $ifstatus | sed -e 's/.*<//' -e 's/>.*//' -e 's/LOWER_UP//' | grep -q 'UP'
+	if [ "$?" -ne 0 ]; then
+		return 1
+	fi
+	return 0
+}
+
+interface_lower_is_up() {
+	local ifstatus=$(${IP2UTIL} -o link show $1)
+	echo $ifstatus | grep -q 'LOWER_UP'
+	if [ "$?" -ne 0 ]; then
+		return 1
+	fi
+	return 0
+}
+
+macvlan_validate_all() {
+	check_binary ${IP2UTIL}
+	check_binary ${GREP}
+
+	# MACVLAN kernel module should be loaded.
+	lsmod | grep -q 'macvlan'
+	if [ "$?" -ne 0 ]; then
+		return $OCF_ERR_INSTALLED
+	fi
+
+	# MACVLAN interface name shoud not be empty.
+	if [ -z "$OCF_RESKEY_macvlan_ifname" ]; then
+		ocf_log err "Invalid OCF_RESKEY_macvlan_ifname: value cannot be empty"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	# the echo .. is the equivalent of strlen in bash
+	#
+	# /usr/include/linux/if.h:#define IFNAMSIZ        16
+	# needs to include 0 byte end string
+
+	if [ "${#OCF_RESKEY_macvlan_ifname}" -gt 15 ]; then
+		ocf_log err "Invalid OCF_RESKEY_macvlan_ifname: name is too long"
+		return $OCF_ERR_CONFIGURED
+	fi
+	if [ "${#OCF_RESKEY_macvlan_linkto}" -gt 15 ]; then
+		ocf_log err "Invalid OCF_RESKEY_macvlan_linkto: name is too long"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	# SysFS network class should be exists in /sys.
+	if [ ! -d "/sys/class/net" ]; then
+		ocf_log err "Unable to find sysfs network class in /sys"
+		return $OCF_ERR_INSTALLED
+	fi
+
+	# MACVLAN interface should not already exists.
+	if [ -e "/sys/class/net/${OCF_RESKEY_macvlan_ifname}" ]; then
+		ocf_log err "Invalid OCF_RESKEY_macvlan_ifname: $OCF_RESKEY_macvlan_ifname already exists"
+		return $OCF_ERR_GENERIC
+	fi
+
+	# Interface which MACVLAN interface links to should be exists.
+	if [ ! -e "/sys/class/net/${OCF_RESKEY_macvlan_linkto}" ]; then
+		ocf_log err "Invalid OCF_RESKEY_macvlan_linkto: $OCF_RESKEY_macvlan_linkto does not exists"
+		return $OCF_ERR_GENERIC
+	fi
+
+	# MAC address format of MACVLAN interface should be delimited by ":".
+	echo "${OCF_RESKEY_macvlan_macaddr}" | ${GREP} -q -E '^[[:xdigit:]]{2}(:[[:xdigit:]]{2}){5}$'
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "Invalid OCF_RESKEY_macvlan_macaddr: MAC address should be delimited by ':'"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	# MAC address length of MACVLAN interface should be 17 characters.
+	if [ "${#OCF_RESKEY_macvlan_macaddr}" -ne 17 ]; then
+		ocf_log err "Invalid OCF_RESKEY_macvlan_macaddr: MAC address length should be 17 contains delimiter ':'"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	# MAC address should be different from MACVLAN interface links to.
+	${IP2UTIL} -o link show ${OCF_RESKEY_macvlan_linkto} | grep -q ${OCF_RESKEY_macvlan_macaddr}
+	if [ "$?" -eq 0 ]; then
+		ocf_log err "MAC address of MACVLAN interface should not same as its linked"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	return $OCF_SUCCESS
+}
+
+
+case $__OCF_ACTION in
+meta-data)	meta_data
+		exit $OCF_SUCCESS
+		;;
+start)		macvlan_start
+		ret="$?"
+		if [ "$ret" -ne "${OCF_SUCCESS}" ]; then
+			macvlan_force_stop
+		fi
+		exit $ret
+		;;
+stop)		macvlan_stop;;
+monitor)	macvlan_monitor;;
+migrate_to)	ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} to ${OCF_RESKEY_CRM_meta_migrate_target}."
+	        macvlan_stop
+		;;
+migrate_from)	ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} from ${OCF_RESKEY_CRM_meta_migrate_source}."
+	        macvlan_start
+		;;
+reload)		ocf_log info "Reloading ${OCF_RESOURCE_INSTANCE} ..."
+		;;
+validate-all)	macvlan_validate;;
+usage|help)	macvlan_usage
+		exit $OCF_SUCCESS
+		;;
+*)		macvlan_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc
+
