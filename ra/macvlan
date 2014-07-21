@@ -168,14 +168,10 @@ macvlan_stop() {
 	if [ "$ret" -eq "${OCF_NOT_RUNNING}" ]; then
 		return $OCF_SUCCESS
 	fi
-	if [ "$ret" -ne "${OCF_ERR_GENERIC}" ]; then
-		return $ret
-	fi
 
 	${IP2UTIL} link set dev ${OCF_RESKEY_macvlan_ifname} down >/dev/null 2>&1
 	if [ "$?" -ne 0 ]; then
-		ocf_log err "MACVLAN interface ${OCF_RESKEY_macvlan_ifname} is unable to be down"
-		return $OCF_ERR_GENERIC
+		ocf_log err "MACVLAN interface ${OCF_RESKEY_macvlan_ifname} is unable to be down, force delete"
 	fi
 
 	${IP2UTIL} link delete ${OCF_RESKEY_macvlan_ifname} >/dev/null 2>&1
