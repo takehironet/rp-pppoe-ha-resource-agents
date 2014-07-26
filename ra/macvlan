@@ -133,27 +133,27 @@ macvlan_start() {
 	address=${OCF_RESKEY_macvlan_macaddr}
 	mode=${OCF_RESKEY_macvlan_mode}
 
-	error="$(${IP2UTIL} link set dev ${linkto} up)"
+	error=$(${IP2UTIL} link set dev ${linkto} up)
 	if [ "$?" -ne 0 ]; then
 		ocf_log err "Unable to be up ${linkto}: ${error}"
 		return $OCF_ERR_GENERIC
 	fi
 
-	error="$(${IP2UTIL} link add link ${linkto} name ${ifname} address ${address} type macvlan mode ${mode})"
+	error=$(${IP2UTIL} link add link ${linkto} name ${ifname} address ${address} type macvlan mode ${mode})
 	if [ "$?" -ne 0 ]; then
 		ocf_log err "Unable to create MACVLAN interface ${ifname}(${address}) which links to ${linkto}: ${error}"
 		return $OCF_ERR_GENERIC
 	fi
 
-	error="$(${IP2UTIL} link set dev ${ifname} up)"
+	error=$(${IP2UTIL} link set dev ${ifname} up)
 	if [ "$?" -ne 0 ]; then
 		ocf_log err "Unable to be up MACVLAN interface ${ifname}(${address}) which links to ${linkto}: ${error}"
 		return $OCF_ERR_GENERIC
 	fi
 
-	error="$(touch "$HA_RSCTMP/macvlan.$OCF_RESKEY_macvlan_ifname" 2>&1)"
+	touch "$HA_RSCTMP/macvlan.$OCF_RESKEY_macvlan_ifname" 2>&1
 	if [ "$?" -ne 0 ]; then
-		ocf_log err "Unable to create lock file for MACVLAN ${OCF_RESKEY_vlan_name}: ${error}"
+		ocf_log err "Unable to create lock file for MACVLAN ${OCF_RESKEY_vlan_name}"
 		return $OCF_ERR_GENERIC
 	fi
 
