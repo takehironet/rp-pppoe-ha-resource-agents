@@ -135,7 +135,7 @@ END
 
 rp_pppoe_ha_usage() {
 	cat <<END
-usage: $0 {start|stop|monitor|migrate_to|migrate_from|validate-all|meta-data}
+usage: $0 {start|stop|monitor|promote|demote|notify|migrate_to|migrate_from|validate-all|meta-data}
 
 Expects to have a fully populated OCF RA-compliant environment set.
 END
@@ -144,6 +144,11 @@ END
 rp_pppoe_ha_promote() {
 	local ret
 	local status
+	local sessid
+	local ac_macaddr
+	local stby_sessid
+	local stby_ac_macaddr
+	local ether_if
 
 	rp_pppoe_ha_validate_all || exit $?
 	rp_pppoe_ha_monitor
@@ -166,6 +171,20 @@ rp_pppoe_ha_promote() {
 			;;
 	esac
 
+	# Forcibly disconnect
+	stby_sessid=$(crm_attribute -l reboot -n pppoe_stby_sessid -G -q)
+	stby_ac_macaddr=$(crm_attribute -l reboot -n pppoe_stby_acmac -G -q)
+	if [ "x$stby_sessid" != "x" -a "x$stby_ac_macaddr" != "x" ]; then
+		if ethif_is_configured; then
+			ether_if=$(get_configured_ethname)
+			ocf_log info "Perform disconnection forcibly: sessid=$stby_sessid, ac_mac=$stby_ac_macaddr"
+			${OCF_RESKEY_pppoe_cmd} -k -e $stby_sessid:$stby_ac_macaddr -I $ether_if
+			if [ $? -eq 0 ]; then
+				ocf_log info "Performed disconnection."
+			fi
+		fi
+	fi
+
 	sleep 1
 	${OCF_RESKEY_pppoe_connect_cmd} ${OCF_RESKEY_pppoe_config}
 	if [ "$?" -ne 0 ]; then
@@ -180,6 +199,21 @@ rp_pppoe_ha_promote() {
 	status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
 	if [ "x${status}" != "xMaster" ]; then
 		return $OCF_ERR_GENERIC
+	fi
+
+	if [ -e "${OCF_RESKEY_sessid_file}" ]; then
+		ocf_log info "PPPoE session id file found."
+		sessid=$(cat "${OCF_RESKEY_sessid_file}")
+		if ocf_is_decimal $sessid; then
+			ocf_log debug "PPPoE session id is validated."
+			crm_attribute -l reboot -s pppoe_sessid -n pppoe_sessid -v $sessid
+		fi
+	fi
+
+	ac_macaddr=$(get_ac_macaddr)
+	if [ "x$ac_macaddr" != "x" ]; then
+		ocf_log info "AC MAC Address retrieved."
+		crm_attribute -l reboot -s pppoe_acmac -n pppoe_acmac -v "$ac_macaddr"
 	fi
 
 	crm_master -l reboot -v 100
@@ -212,6 +246,18 @@ rp_pppoe_ha_demote() {
 	rp_pppoe_ha_monitor
 	ret=$?
 
+	if [ -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
+		clear_status_file
+		if [ "$?" -ne 0 ]; then
+			return $OCF_ERR_GENERIC
+		fi
+
+		status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
+		if [ "x${status}" != "x" ]; then
+			return $OCF_ERR_GENERIC
+		fi
+	fi
+
 	case "$ret" in
 		"$OCF_RUNNING_MASTER")
 			ocf_log debug "Resource is currently running as Master."
@@ -226,25 +272,12 @@ rp_pppoe_ha_demote() {
 			;;
 		*)
 			ocf_log err "Demoting by unexpecting error."
-			clear_status_file
-			#exit $ret
 			exit $OCF_SUCCESS
 			;;
 	esac
 
-
 	${OCF_RESKEY_pppoe_stop_cmd} ${OCF_RESKEY_pppoe_config}
 	if [ "$?" -ne 0 ]; then
-		return $OCF_ERR_GENERIC
-	fi
-
-	clear_status_file
-	if [ "$?" -ne 0 ]; then
-		return $OCF_ERR_GENERIC
-	fi
-
-	status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
-	if [ "x${status}" != "x" ]; then
 		return $OCF_ERR_GENERIC
 	fi
 
@@ -284,6 +317,45 @@ rp_pppoe_ha_stop() {
 	fi
 
 	crm_master -l reboot -D
+	return $OCF_SUCCESS
+}
+
+rp_pppoe_ha_notify() {
+	local type_op
+	local ac_mac
+	local sessid
+	local master_uname
+	local promote_uname
+	local start_uname
+	local CRM_ATTRIB_SET_ACMAC="crm_attribute -l reboot -n pppoe_stby_acmac -s pppoe_stby_acmac"
+	local CRM_ATTRIB_SET_SESSID="crm_attribute -l reboot -n pppoe_stby_sessid -s pppoe_stby_sessid"
+	local CRM_ATTRIB_GET_ACMAC="crm_attribute -l reboot -n pppoe_acmac -G -q -N"
+	local CRM_ATTRIB_GET_SESSID="crm_attribute -l reboot -n pppoe_sessid -G -q -N"
+
+	type_op="${OCF_RESKEY_CRM_meta_notify_type}-${OCF_RESKEY_CRM_meta_notify_operation}"
+
+	case "$type_op" in
+		'post-promote')
+			promote_uname=$OCF_RESKEY_CRM_meta_notify_promote_uname
+			if [ "$(uname -n)" != "$promote_uname" ]; then
+				ac_mac=$($CRM_ATTRIB_GET_ACMAC $promote_uname)
+				sessid=$($CRM_ATTRIB_GET_SESSID $promote_uname)
+				$CRM_ATTRIB_SET_ACMAC -N $(uname -n) -v $ac_mac
+				$CRM_ATTRIB_SET_SESSID -N $(uname -n) -v $sessid
+			fi
+			;;
+		'post-start')
+			start_uname=$OCF_RESKEY_CRM_meta_notify_start_uname
+			master_uname=$OCF_RESKEY_CRM_meta_notify_master_uname
+			if [ "$(uname -n)" = $start_uname ]; then
+				ac_mac=$($CRM_ATTRIB_GET_ACMAC $master_uname)
+				sessid=$($CRM_ATTRIB_GET_SESSID $master_uname)
+				$CRM_ATTRIB_SET_ACMAC -N $(uname -n) -v $ac_mac
+				$CRM_ATTRIB_SET_SESSID -N $(uname -n) -v $sessid
+			fi
+			;;
+	esac
+
 	return $OCF_SUCCESS
 }
 
@@ -337,7 +409,7 @@ interface_lower_is_up() {
 }
 
 get_ac_macaddr() {
-	local pppoe=$(${OCF_RESKEY_pppoe_cmd})
+	local pppoe=$OCF_RESKEY_pppoe_cmd
 	local ETH
 	local macaddr
 
@@ -347,8 +419,8 @@ get_ac_macaddr() {
 
 	ETH=$(get_configured_ethname)
 
-	macaddr=$(${pppoe} -A -n -t 1 -I ${ETH} | ${GREP} 'AC-Ethenet-Address:' | cut -d' ' -f2)
-	echo "${macaddr}"
+	macaddr=$($pppoe -A -n -t 1 -I $ETH | $GREP 'AC-Ethernet-Address:' | cut -d' ' -f2)
+	echo "$macaddr"
 }
 
 get_configured_ethname() {
@@ -428,6 +500,7 @@ stop)		rp_pppoe_ha_stop;;
 monitor)	rp_pppoe_ha_monitor;;
 promote)	rp_pppoe_ha_promote;;
 demote)		rp_pppoe_ha_demote;;
+notify)		rp_pppoe_ha_notify;;
 migrate_to)	ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} to ${OCF_RESKEY_CRM_meta_migrate_target}."
 	        rp_pppoe_ha_stop
 		;;
