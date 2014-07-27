@@ -141,6 +141,51 @@ Expects to have a fully populated OCF RA-compliant environment set.
 END
 }
 
+rp_pppoe_ha_promote() {
+	local ret
+	local status
+
+	rp_pppoe_ha_validate_all || exit $?
+	rp_pppoe_ha_monitor
+	ret=$?
+	case "$ret" in
+		"$OCF_SUCCESS")
+			ocf_log debug "Resource is currently running as slave. Promoting."
+			;;
+		"$OCF_RUNNING_MASTER")
+			ocf_log info "Already running as master"
+			return $OCF_SUCCESS
+			;;
+		"$OCF_NOT_RUNNING")
+			ocf_log info "Resource is currently not running. Starting."
+			rp_pppoe_ha_start
+			;;
+		*)
+			ocf_log err "Unexpected error, cannot promote."
+			exit $ret
+			;;
+	esac
+
+	sleep 1
+	${OCF_RESKEY_pppoe_connect_cmd} ${OCF_RESKEY_pppoe_config}
+	if [ "$?" -ne 0 ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	echo "Master" > "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}"
+	if [ "$?" -ne 0 ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
+	if [ "x${status}" != "xMaster" ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	crm_master -l reboot -v 100
+	return $OCF_SUCCESS
+}
+
 rp_pppoe_ha_start() {
 	local ret
 
@@ -151,49 +196,107 @@ rp_pppoe_ha_start() {
 		return $ret
 	fi
 
-	${OCF_RESKEY_pppoe_connect_cmd} ${OCF_RESKEY_pppoe_config}
-	if [ $? -ne 0 ]; then
-		return $OCF_ERR_GENERIC
-	fi
-
-	touch "$HA_RSCTMP/rp-pppoe-ha.$OCF_RESKEY_ppp_ifname" 2>&1
+	touch "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" 2>&1
 	if [ "$?" -ne 0 ]; then
 		ocf_log err "Unable to create lock file for PPPoE ${OCF_RESKEY_ppp_ifname}"
 		return $OCF_ERR_GENERIC
 	fi
 
+	crm_master -l reboot -v 10
 	return $OCF_SUCCESS
 }
 
-rp_pppoe_ha_stop() {
+rp_pppoe_ha_demote() {
+	local ret
+
 	rp_pppoe_ha_monitor
-	if [ "$?" -eq "${OCF_NOT_RUNNING}" ]; then
-		return $OCF_SUCCESS
-	fi
+	ret=$?
+
+	case "$ret" in
+		"$OCF_RUNNING_MASTER")
+			ocf_log debug "Resource is currently running as Master."
+			;;
+		"$OCF_SUCCESS")
+			ocf_log debug "Resource is currently running as Slave."
+			return $OCF_SUCCESS
+			;;
+		"$OCF_NOT_RUNNING")
+			ocf_log err "Resource is currently not running."
+			exit $OCF_ERR_GENERIC
+			;;
+		*)
+			ocf_log err "Demoting by unexpecting error."
+			clear_status_file
+			#exit $ret
+			exit $OCF_SUCCESS
+			;;
+	esac
+
 
 	${OCF_RESKEY_pppoe_stop_cmd} ${OCF_RESKEY_pppoe_config}
 	if [ "$?" -ne 0 ]; then
 		return $OCF_ERR_GENERIC
 	fi
-	rm -f "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" 2>&1
+
+	clear_status_file
 	if [ "$?" -ne 0 ]; then
 		return $OCF_ERR_GENERIC
 	fi
 
+	status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
+	if [ "x${status}" != "x" ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	crm_master -l reboot -v 10
+	return $OCF_SUCCESS
+}
+
+rp_pppoe_ha_stop() {
+	local ret
+
+	rp_pppoe_ha_monitor
+	ret=$?
+
+	case "$ret" in
+		"$OCF_SUCCESS")
+			ocf_log debug "Resource is currently running."
+			;;
+		"$OCF_RUNNING_MASTER")
+			ocf_log info "Resource is currently running as Master."
+			rp_pppoe_ha_demote
+			if [ "$?" -ne 0 ]; then
+				ocf_log warn "Demote failed."
+			fi
+			;;
+		"$OCF_NOT_RUNNING")
+			ocf_log info "Resource is already stopped."
+			return $OCF_SUCCESS
+			;;
+		*)
+			ocf_log err "Unexpected error."
+			;;
+	esac
+
+	remove_status_file
+	if [ "$?" -ne 0 ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	crm_master -l reboot -D
 	return $OCF_SUCCESS
 }
 
 
 rp_pppoe_ha_monitor() {
-	local iflink
 	local pppoestatus
-
-	${IP2UTIL} -o link show ${OCF_RESKEY_ppp_ifname}
-	iflink=$?
+	local status
 
 	${OCF_RESKEY_pppoe_status_cmd} ${OCF_RESKEY_pppoe_config}
 	pppoestatus=$?
 
+	# If PPPoE connection is established, the node is as master.
+	# If not but temporary file exists, the node is as slave.
 	if [ "$pppoestatus" -eq 0 ]; then
 		if [ ! -e "${OCF_RESKEY_sessid_file}" ]; then
 			return $OCF_ERR_GENERIC
@@ -203,33 +306,16 @@ rp_pppoe_ha_monitor() {
 		fi
 	else
 		if [ -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
-			rm -f "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" >/dev/null 2>&1
-			if [ "$?" -ne 0 ]; then
-				ocf_log err "Unable to remove lock file for PPPoE ${OCF_RESKEY_ppp_ifname}"
+			status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
+			if [ "x$status" == "xMaster" ]; then
+				ocf_log err "Node is running as Master but no PPPoE connection found"
 				return $OCF_ERR_GENERIC
 			fi
+			return $OCF_SUCCESS
 		fi
 		return $OCF_NOT_RUNNING
 	fi
-	if [ "$iflink" -eq 0 ]; then
-		if [ ! -e "${OCF_RESKEY_sessid_file}" ]; then
-			return $OCF_ERR_GENERIC
-		fi
-		if [ ! -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
-			return $OCF_ERR_GENERIC
-		fi
-	else
-		if [ -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
-			rm -f "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" >/dev/null 2>&1
-			if [ "$?" -ne 0 ]; then
-				ocf_log err "Unable to remove lock file for PPPoE ${OCF_RESKEY_ppp_ifname}"
-				return $OCF_ERR_GENERIC
-			fi
-		fi
-		return $OCF_NOT_RUNNING
-	fi
-
-	return $OCF_SUCCESS
+	return $OCF_RUNNING_MASTER
 }
 
 interface_is_up() {
@@ -283,6 +369,25 @@ ethif_is_configured() {
 	return 1
 }
 
+clear_status_file() {
+	if [ -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
+		echo -n > "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}"
+		if [ "$?" -ne 0 ]; then
+			return 1
+		fi
+		return 0
+	fi
+	return 1
+}
+
+remove_status_file() {
+	rm -f "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" 2>&1
+	if [ "$?" -eq 0 ];then
+		return 0
+	fi
+	return 1
+}
+
 rp_pppoe_ha_validate_all() {
 	check_binary ${IP2UTIL}
 	check_binary ${GREP}
@@ -321,6 +426,8 @@ start)		rp_pppoe_ha_start
 		;;
 stop)		rp_pppoe_ha_stop;;
 monitor)	rp_pppoe_ha_monitor;;
+promote)	rp_pppoe_ha_promote;;
+demote)		rp_pppoe_ha_demote;;
 migrate_to)	ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} to ${OCF_RESKEY_CRM_meta_migrate_target}."
 	        rp_pppoe_ha_stop
 		;;
