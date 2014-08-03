@@ -1,0 +1,523 @@
+#!/bin/bash
+#
+#	RP-PPPoE-HA RA.
+#	It manages PPPoE connection.
+#
+# Copyright (c) 2014 Takehiro Matsushima  All Rights Reserved.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# Defaults
+OCF_RESKEY_pppoe_connect_cmd_default="pppoe-connect"
+OCF_RESKEY_pppoe_stop_cmd_default="pppoe-stop"
+OCF_RESKEY_pppoe_status_cmd_default="pppoe-status"
+OCF_RESKEY_pppoe_cmd_default="pppoe"
+
+: ${OCF_RESKEY_pppoe_connect_cmd=${OCF_RESKEY_pppoe_connect_cmd_default}}
+: ${OCF_RESKEY_pppoe_stop_cmd=${OCF_RESKEY_pppoe_stop_cmd_default}}
+: ${OCF_RESKEY_pppoe_status_cmd=${OCF_RESKEY_pppoe_status_cmd_default}}
+: ${OCF_RESKEY_pppoe_cmd=${OCF_RESKEY_pppoe_cmd_default}}
+
+
+#######################################################################
+
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="rp-pppoe-ha" version="0.9">
+<version>0.9</version>
+
+<longdesc lang="en">
+This RA manages PPPoE connection.
+</longdesc>
+<shortdesc lang="en">Manages PPPoE connection</shortdesc>
+
+<parameters>
+<parameter name="ppp_ifname" unique="1" required="1">
+<longdesc lang="en">
+PPP interface name.
+</longdesc>
+<shortdesc lang="en">ppp ifname</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="sessid_file" unique="1" required="1">
+<longdesc lang="en">
+PPPoE session ID file path to manage session.
+</longdesc>
+<shortdesc lang="en">Session ID file location</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="pppoe_config" unique="1" required="1">
+<longdesc lang="en">
+PPPoE configuration file path.
+It likes '/etc/sysconfig/network-scripts/ifcfg-ppp0'.
+</longdesc>
+<shortdesc lang="en">PPPoE config file path</shortdesc>
+<content type="string" />
+</parameter>
+
+<parameter name="pppoe_cmd" unique="0" required="0">
+<longdesc lang="en">
+Low level command name to PPPoE.
+</longdesc>
+<shortdesc lang="en">Low level PPPoE command</shortdesc>
+<content type="string" default="pppoe"/>
+</parameter>
+
+<parameter name="pppoe_connect_cmd" unique="0" required="0">
+<longdesc lang="en">
+Command name to connect PPPoE.
+</longdesc>
+<shortdesc lang="en">PPPoE connect command</shortdesc>
+<content type="string" default="pppoe-connect"/>
+</parameter>
+
+<parameter name="pppoe_stop_cmd" unique="0" required="0">
+<longdesc lang="en">
+Command name to disconnect PPPoE.
+</longdesc>
+<shortdesc lang="en">PPPoE disconnect command</shortdesc>
+<content type="string" default="pppoe-stop"/>
+</parameter>
+
+<parameter name="pppoe_status_cmd" unique="0" required="0">
+<longdesc lang="en">
+Command name to monitor PPPoE status.
+</longdesc>
+<shortdesc lang="en">PPPoE status command</shortdesc>
+<content type="string" default="pppoe-status"/>
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="30" />
+<action name="stop"         timeout="30" />
+<action name="monitor"      timeout="30" interval="20" depth="0" />
+<action name="reload"       timeout="30" />
+<action name="migrate_to"   timeout="30" />
+<action name="migrate_from" timeout="30" />
+<action name="meta-data"    timeout="5" />
+<action name="validate-all"   timeout="20" />
+</actions>
+</resource-agent>
+END
+}
+
+#######################################################################
+
+rp_pppoe_ha_usage() {
+	cat <<END
+usage: $0 {start|stop|monitor|promote|demote|notify|migrate_to|migrate_from|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+rp_pppoe_ha_promote() {
+	local ret
+	local status
+	local sessid
+	local ac_macaddr
+	local stby_sessid
+	local stby_ac_macaddr
+	local ether_if
+
+	rp_pppoe_ha_validate_all || exit $?
+	rp_pppoe_ha_monitor
+	ret=$?
+	case "$ret" in
+		"$OCF_SUCCESS")
+			ocf_log debug "Resource is currently running as slave. Promoting."
+			;;
+		"$OCF_RUNNING_MASTER")
+			ocf_log info "Already running as master"
+			return $OCF_SUCCESS
+			;;
+		"$OCF_NOT_RUNNING")
+			ocf_log info "Resource is currently not running. Starting."
+			rp_pppoe_ha_start
+			;;
+		*)
+			ocf_log err "Unexpected error, cannot promote."
+			exit $ret
+			;;
+	esac
+
+	# Forcibly disconnect
+	stby_sessid=$(crm_attribute -l reboot -n pppoe_stby_sessid -G -q)
+	stby_ac_macaddr=$(crm_attribute -l reboot -n pppoe_stby_acmac -G -q)
+	if [ "x$stby_sessid" != "x" -a "x$stby_ac_macaddr" != "x" ]; then
+		if ethif_is_configured; then
+			ether_if=$(get_configured_ethname)
+			ocf_log info "Perform disconnection forcibly: sessid=$stby_sessid, ac_mac=$stby_ac_macaddr"
+			${OCF_RESKEY_pppoe_cmd} -k -e $stby_sessid:$stby_ac_macaddr -I $ether_if
+			if [ $? -eq 0 ]; then
+				ocf_log info "Performed disconnection."
+			fi
+		fi
+	fi
+
+	sleep 1
+	${OCF_RESKEY_pppoe_connect_cmd} ${OCF_RESKEY_pppoe_config}
+	if [ "$?" -ne 0 ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	echo "Master" > "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}"
+	if [ "$?" -ne 0 ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
+	if [ "x${status}" != "xMaster" ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	if [ -e "${OCF_RESKEY_sessid_file}" ]; then
+		ocf_log info "PPPoE session id file found."
+		sessid=$(cat "${OCF_RESKEY_sessid_file}")
+		if ocf_is_decimal $sessid; then
+			ocf_log debug "PPPoE session id is validated."
+			crm_attribute -l reboot -s pppoe_sessid -n pppoe_sessid -v $sessid
+		fi
+	fi
+
+	ac_macaddr=$(get_ac_macaddr)
+	if [ "x$ac_macaddr" != "x" ]; then
+		ocf_log info "AC MAC Address retrieved."
+		crm_attribute -l reboot -s pppoe_acmac -n pppoe_acmac -v "$ac_macaddr"
+	fi
+
+	crm_master -l reboot -v 100
+	return $OCF_SUCCESS
+}
+
+rp_pppoe_ha_start() {
+	local ret
+
+	rp_pppoe_ha_validate_all || exit $?
+	rp_pppoe_ha_monitor
+	ret=$?
+	if [ "$ret" -ne "${OCF_NOT_RUNNING}" ]; then
+		return $ret
+	fi
+
+	touch "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" 2>&1
+	if [ "$?" -ne 0 ]; then
+		ocf_log err "Unable to create lock file for PPPoE ${OCF_RESKEY_ppp_ifname}"
+		return $OCF_ERR_GENERIC
+	fi
+
+	crm_master -l reboot -v 10
+	return $OCF_SUCCESS
+}
+
+rp_pppoe_ha_demote() {
+	local ret
+
+	rp_pppoe_ha_monitor
+	ret=$?
+
+	if [ -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
+		clear_status_file
+		if [ "$?" -ne 0 ]; then
+			return $OCF_ERR_GENERIC
+		fi
+
+		status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
+		if [ "x${status}" != "x" ]; then
+			return $OCF_ERR_GENERIC
+		fi
+	fi
+
+	case "$ret" in
+		"$OCF_RUNNING_MASTER")
+			ocf_log debug "Resource is currently running as Master."
+			;;
+		"$OCF_SUCCESS")
+			ocf_log debug "Resource is currently running as Slave."
+			return $OCF_SUCCESS
+			;;
+		"$OCF_NOT_RUNNING")
+			ocf_log err "Resource is currently not running."
+			exit $OCF_ERR_GENERIC
+			;;
+		*)
+			ocf_log err "Demoting by unexpecting error."
+			exit $OCF_SUCCESS
+			;;
+	esac
+
+	${OCF_RESKEY_pppoe_stop_cmd} ${OCF_RESKEY_pppoe_config}
+	if [ "$?" -ne 0 ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	crm_master -l reboot -v 10
+	return $OCF_SUCCESS
+}
+
+rp_pppoe_ha_stop() {
+	local ret
+
+	rp_pppoe_ha_monitor
+	ret=$?
+
+	case "$ret" in
+		"$OCF_SUCCESS")
+			ocf_log debug "Resource is currently running."
+			;;
+		"$OCF_RUNNING_MASTER")
+			ocf_log info "Resource is currently running as Master."
+			rp_pppoe_ha_demote
+			if [ "$?" -ne 0 ]; then
+				ocf_log warn "Demote failed."
+			fi
+			;;
+		"$OCF_NOT_RUNNING")
+			ocf_log info "Resource is already stopped."
+			return $OCF_SUCCESS
+			;;
+		*)
+			ocf_log err "Unexpected error."
+			;;
+	esac
+
+	remove_status_file
+	if [ "$?" -ne 0 ]; then
+		return $OCF_ERR_GENERIC
+	fi
+
+	crm_master -l reboot -D
+	return $OCF_SUCCESS
+}
+
+rp_pppoe_ha_notify() {
+	local type_op
+	local ac_mac
+	local sessid
+	local master_uname
+	local promote_uname
+	local start_uname
+	local CRM_ATTRIB_SET_ACMAC="crm_attribute -l reboot -n pppoe_stby_acmac -s pppoe_stby_acmac"
+	local CRM_ATTRIB_SET_SESSID="crm_attribute -l reboot -n pppoe_stby_sessid -s pppoe_stby_sessid"
+	local CRM_ATTRIB_GET_ACMAC="crm_attribute -l reboot -n pppoe_acmac -G -q -N"
+	local CRM_ATTRIB_GET_SESSID="crm_attribute -l reboot -n pppoe_sessid -G -q -N"
+
+	type_op="${OCF_RESKEY_CRM_meta_notify_type}-${OCF_RESKEY_CRM_meta_notify_operation}"
+
+	case "$type_op" in
+		'post-promote')
+			promote_uname=$OCF_RESKEY_CRM_meta_notify_promote_uname
+			if [ "$(uname -n)" != "$promote_uname" ]; then
+				ac_mac=$($CRM_ATTRIB_GET_ACMAC $promote_uname)
+				sessid=$($CRM_ATTRIB_GET_SESSID $promote_uname)
+				$CRM_ATTRIB_SET_ACMAC -N $(uname -n) -v $ac_mac
+				$CRM_ATTRIB_SET_SESSID -N $(uname -n) -v $sessid
+			fi
+			;;
+		'post-start')
+			start_uname=$OCF_RESKEY_CRM_meta_notify_start_uname
+			master_uname=$OCF_RESKEY_CRM_meta_notify_master_uname
+			if [ "$(uname -n)" = $start_uname ]; then
+				ac_mac=$($CRM_ATTRIB_GET_ACMAC $master_uname)
+				sessid=$($CRM_ATTRIB_GET_SESSID $master_uname)
+				$CRM_ATTRIB_SET_ACMAC -N $(uname -n) -v $ac_mac
+				$CRM_ATTRIB_SET_SESSID -N $(uname -n) -v $sessid
+			fi
+			;;
+	esac
+
+	return $OCF_SUCCESS
+}
+
+
+rp_pppoe_ha_monitor() {
+	local pppoestatus
+	local status
+
+	${OCF_RESKEY_pppoe_status_cmd} ${OCF_RESKEY_pppoe_config}
+	pppoestatus=$?
+
+	# If PPPoE connection is established, the node is as master.
+	# If not but temporary file exists, the node is as slave.
+	if [ "$pppoestatus" -eq 0 ]; then
+		if [ ! -e "${OCF_RESKEY_sessid_file}" ]; then
+			return $OCF_ERR_GENERIC
+		fi
+		if [ ! -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
+			return $OCF_ERR_GENERIC
+		fi
+	else
+		if [ -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
+			status=$(cat "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}")
+			if [ "x$status" == "xMaster" ]; then
+				ocf_log err "Node is running as Master but no PPPoE connection found"
+				return $OCF_ERR_GENERIC
+			fi
+			return $OCF_SUCCESS
+		fi
+		return $OCF_NOT_RUNNING
+	fi
+	return $OCF_RUNNING_MASTER
+}
+
+interface_is_up() {
+	local ifstatus=$(${IP2UTIL} -o link show $1)
+	echo $ifstatus | sed -e 's/.*<//' -e 's/>.*//' -e 's/LOWER_UP//' | grep -q 'UP'
+	if [ "$?" -ne 0 ]; then
+		return 1
+	fi
+	return 0
+}
+
+interface_lower_is_up() {
+	local ifstatus=$(${IP2UTIL} -o link show $1)
+	echo $ifstatus | grep -q 'LOWER_UP'
+	if [ "$?" -ne 0 ]; then
+		return 1
+	fi
+	return 0
+}
+
+get_ac_macaddr() {
+	local pppoe=$OCF_RESKEY_pppoe_cmd
+	local ETH
+	local macaddr
+
+	if ! ethif_is_configured ; then
+		exit $OCF_ERR_CONFIGURED
+	fi
+
+	ETH=$(get_configured_ethname)
+
+	macaddr=$($pppoe -A -n -t 1 -I $ETH | $GREP 'AC-Ethernet-Address:' | cut -d' ' -f2)
+	echo "$macaddr"
+}
+
+get_configured_ethname() {
+	local ETH
+
+	source ${OCF_RESKEY_pppoe_config}
+	if [ "${ETH-UNDEF}" != "UNDEF" ]; then
+		echo "${ETH}"
+	fi
+}
+
+ethif_is_configured() {
+	local ETH=$(get_configured_ethname)
+
+	if [ "${ETH}" != "" ]; then
+		return 0
+	fi
+	return 1
+}
+
+clear_status_file() {
+	if [ -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
+		echo -n > "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}"
+		if [ "$?" -ne 0 ]; then
+			return 1
+		fi
+		return 0
+	fi
+	return 1
+}
+
+remove_status_file() {
+	rm -f "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" 2>&1
+	if [ "$?" -eq 0 ];then
+		return 0
+	fi
+	return 1
+}
+
+rp_pppoe_ha_validate_all() {
+	check_binary ${IP2UTIL}
+	check_binary ${GREP}
+	check_binary ${OCF_RESKEY_pppoe_connect_cmd}
+	check_binary ${OCF_RESKEY_pppoe_stop_cmd}
+	check_binary ${OCF_RESKEY_pppoe_status_cmd}
+	check_binary ${OCF_RESKEY_pppoe_cmd}
+
+	# PPP interface name shoud not be empty.
+	if [ -z "$OCF_RESKEY_ppp_ifname" ]; then
+		ocf_log err "Invalid OCF_RESKEY_ppp_ifname: value cannot be empty"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	# the echo .. is the equivalent of strlen in bash
+	#
+	# /usr/include/linux/if.h:#define IFNAMSIZ        16
+	# needs to include 0 byte end string
+
+	if [ "${#OCF_RESKEY_ppp_ifname}" -gt 15 ]; then
+		ocf_log err "Invalid OCF_RESKEY_ppp_ifname: name is too long"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	return $OCF_SUCCESS
+}
+
+
+case $__OCF_ACTION in
+meta-data)	meta_data
+		exit $OCF_SUCCESS
+		;;
+start)		rp_pppoe_ha_start
+		ret="$?"
+		exit $ret
+		;;
+stop)		rp_pppoe_ha_stop;;
+monitor)	rp_pppoe_ha_monitor;;
+promote)	rp_pppoe_ha_promote;;
+demote)		rp_pppoe_ha_demote;;
+notify)		rp_pppoe_ha_notify;;
+migrate_to)	ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} to ${OCF_RESKEY_CRM_meta_migrate_target}."
+	        rp_pppoe_ha_stop
+		;;
+migrate_from)	ocf_log info "Migrating ${OCF_RESOURCE_INSTANCE} from ${OCF_RESKEY_CRM_meta_migrate_source}."
+	        rp_pppoe_ha_start
+		;;
+reload)		ocf_log info "Reloading ${OCF_RESOURCE_INSTANCE} ..."
+		;;
+validate-all)	rp_pppoe_ha_validate;;
+usage|help)	rp_pppoe_ha_usage
+		exit $OCF_SUCCESS
+		;;
+*)		rp_pppoe_ha_usage
+		exit $OCF_ERR_UNIMPLEMENTED
+		;;
+esac
+rc=$?
+ocf_log debug "${OCF_RESOURCE_INSTANCE} $__OCF_ACTION : $rc"
+exit $rc
+
