@@ -251,12 +251,6 @@ macvlan_validate_all() {
 	check_binary ${IP2UTIL}
 	check_binary ${GREP}
 
-	# MACVLAN kernel module should be loaded.
-	lsmod | grep -q 'macvlan'
-	if [ "$?" -ne 0 ]; then
-		return $OCF_ERR_INSTALLED
-	fi
-
 	# MACVLAN interface name shoud not be empty.
 	if [ -z "$OCF_RESKEY_macvlan_ifname" ]; then
 		ocf_log err "Invalid OCF_RESKEY_macvlan_ifname: value cannot be empty"
@@ -311,7 +305,7 @@ macvlan_validate_all() {
 	# MAC address should be different from MACVLAN interface links to.
 	${IP2UTIL} -o link show ${OCF_RESKEY_macvlan_linkto} | grep -q ${OCF_RESKEY_macvlan_macaddr}
 	if [ "$?" -eq 0 ]; then
-		ocf_log err "MAC address of MACVLAN interface should not same as its linked"
+		ocf_log err "MAC address of MACVLAN interface should not be same as its linked"
 		return $OCF_ERR_CONFIGURED
 	fi
 
