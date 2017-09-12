@@ -146,6 +146,7 @@ rp_pppoe_ha_promote() {
 	local status
 	local sessid
 	local ac_macaddr
+	local self_sessid
 	local stby_sessid
 	local stby_ac_macaddr
 	local ether_if
@@ -172,15 +173,17 @@ rp_pppoe_ha_promote() {
 	esac
 
 	# Forcibly disconnect
+	self_sessid=$(crm_attribute -l reboot -n pppoe_sessid -G -q)
 	stby_sessid=$(crm_attribute -l reboot -n pppoe_stby_sessid -G -q)
 	stby_ac_macaddr=$(crm_attribute -l reboot -n pppoe_stby_acmac -G -q)
+	ocf_log debug "PPPoE Sessions: self_sessid=$self_sessid, stby_sessid=$stby_sessid, ac_mac=$stby_ac_macaddr"
 	if [ "x$stby_sessid" != "x" -a "x$stby_ac_macaddr" != "x" ]; then
 		if ethif_is_configured; then
 			ether_if=$(get_configured_ethname)
-			ocf_log info "Perform disconnection forcibly: sessid=$stby_sessid, ac_mac=$stby_ac_macaddr"
+			ocf_log notice "Perform disconnection forcibly: self_sessid=$self_sessid, stby_sessid=$stby_sessid, ac_mac=$stby_ac_macaddr"
 			${OCF_RESKEY_pppoe_cmd} -k -e $stby_sessid:$stby_ac_macaddr -I $ether_if
 			if [ $? -eq 0 ]; then
-				ocf_log info "Performed disconnection."
+				ocf_log notice "Performed disconnection."
 			fi
 		fi
 	fi
@@ -188,11 +191,13 @@ rp_pppoe_ha_promote() {
 	sleep 1
 	${OCF_RESKEY_pppoe_connect_cmd} ${OCF_RESKEY_pppoe_config}
 	if [ "$?" -ne 0 ]; then
+		ocf_log debug "${OCF_RESKEY_pppoe_connect_cmd} returned non-zero: $?"
 		return $OCF_ERR_GENERIC
 	fi
 
 	echo "Master" > "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}"
 	if [ "$?" -ne 0 ]; then
+		ocf_log debug "Failed to write status file with rc $?"
 		return $OCF_ERR_GENERIC
 	fi
 
@@ -327,6 +332,7 @@ rp_pppoe_ha_notify() {
 	local master_uname
 	local promote_uname
 	local start_uname
+	local uname_n=$( uname -n )
 	local CRM_ATTRIB_SET_ACMAC="crm_attribute -l reboot -n pppoe_stby_acmac -s pppoe_stby_acmac"
 	local CRM_ATTRIB_SET_SESSID="crm_attribute -l reboot -n pppoe_stby_sessid -s pppoe_stby_sessid"
 	local CRM_ATTRIB_GET_ACMAC="crm_attribute -l reboot -n pppoe_acmac -G -q -N"
@@ -334,24 +340,43 @@ rp_pppoe_ha_notify() {
 
 	type_op="${OCF_RESKEY_CRM_meta_notify_type}-${OCF_RESKEY_CRM_meta_notify_operation}"
 
+	ocf_log debug "rp_pppoe_ha notify: uname_n=${uname_n}"
+
 	case "$type_op" in
 		'post-promote')
 			promote_uname=$OCF_RESKEY_CRM_meta_notify_promote_uname
-			if [ "$(uname -n)" != "$promote_uname" ]; then
+
+			ocf_log debug "rp_pppoe_ha post-promote: promote_uname=${promote_uname}"
+
+			if [ "$uname_n" != "$promote_uname" ]; then
+				ocf_log debug "rp_pppoe_ha post-promote: uname_n is ne promote_uname"
+
 				ac_mac=$($CRM_ATTRIB_GET_ACMAC $promote_uname)
 				sessid=$($CRM_ATTRIB_GET_SESSID $promote_uname)
-				$CRM_ATTRIB_SET_ACMAC -N $(uname -n) -v $ac_mac
-				$CRM_ATTRIB_SET_SESSID -N $(uname -n) -v $sessid
+
+				ocf_log debug "rp_pppoe_ha post-promote: ac_mac=${ac_mac}, sessid=${sessid}"
+
+				[ "x${ac_mac}" != "x" ] && $CRM_ATTRIB_SET_ACMAC -N $uname_n -v $ac_mac
+				[ "x${sessid}" != "x" ] && $CRM_ATTRIB_SET_SESSID -N $uname_n -v $sessid
 			fi
 			;;
 		'post-start')
 			start_uname=$OCF_RESKEY_CRM_meta_notify_start_uname
 			master_uname=$OCF_RESKEY_CRM_meta_notify_master_uname
-			if [ "$(uname -n)" = $start_uname ]; then
+
+			ocf_log debug "rp_pppoe_ha post-start: start_uname=${start_uname}"
+			ocf_log debug "rp_pppoe_ha post-start: master_uname=${master_uname}"
+
+			if [ "$uname_n" = "$start_uname" ]; then
+				ocf_log debug "rp_pppoe_ha post-start: uname_n eq start_uname"
+
 				ac_mac=$($CRM_ATTRIB_GET_ACMAC $master_uname)
 				sessid=$($CRM_ATTRIB_GET_SESSID $master_uname)
-				$CRM_ATTRIB_SET_ACMAC -N $(uname -n) -v $ac_mac
-				$CRM_ATTRIB_SET_SESSID -N $(uname -n) -v $sessid
+
+				ocf_log debug "rp_pppoe_ha post-start: ac_mac=${ac_mac}, sessid=${sessid}"
+
+				[ "x${ac_mac}" != "x" ] && $CRM_ATTRIB_SET_ACMAC -N $uname_n -v $ac_mac
+				[ "x${sessid}" != "x" ] && $CRM_ATTRIB_SET_SESSID -N $uname_n -v $sessid
 			fi
 			;;
 	esac
@@ -371,9 +396,11 @@ rp_pppoe_ha_monitor() {
 	# If not but temporary file exists, the node is as slave.
 	if [ "$pppoestatus" -eq 0 ]; then
 		if [ ! -e "${OCF_RESKEY_sessid_file}" ]; then
+			ocf_log err "RP-PPPoE-HA Session file has gone."
 			return $OCF_ERR_GENERIC
 		fi
 		if [ ! -e "${HA_RSCTMP}/rp-pppoe-ha.${OCF_RESKEY_ppp_ifname}" ]; then
+			ocf_log err "RP-PPPoE-HA RA Temporary file has gone."
 			return $OCF_ERR_GENERIC
 		fi
 	else
